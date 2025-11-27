@@ -6,6 +6,13 @@ const photoSchema = new mongoose.Schema({
   photoUrl: String,
   uploadedBy: String,
   timestamp: { type: Date, default: Date.now },
+  twitterStatus: {
+    type: String,
+    enum: ["pending", "posted", "skipped"],
+    default: "pending",
+  },
+  twitterPostId: String,
+  twitterBatchKey: String,
   remarks: [
     {
       officerId: String,
