@@ -26,8 +26,15 @@ const findSchoolByIdentifier = async (identifier) => {
 };
 
 const TWITTER_BATCH_SIZE = Number(process.env.TWITTER_BATCH_SIZE || 4);
-const TWITTER_BATCH_WINDOW_MINUTES = Number(process.env.TWITTER_BATCH_WINDOW_MINUTES || 10);
-const TWITTER_SINGLE_FALLBACK_MINUTES = Number(process.env.TWITTER_SINGLE_FALLBACK_MINUTES || 5);
+const TWITTER_BATCH_WINDOW_MINUTES = Number(
+  process.env.TWITTER_BATCH_WINDOW_MINUTES || 10
+);
+const TWITTER_SINGLE_FALLBACK_MINUTES = Number(
+  process.env.TWITTER_SINGLE_FALLBACK_MINUTES || 5
+);
+const TWITTER_MAX_PENDING_MINUTES = Number(
+  process.env.TWITTER_MAX_PENDING_MINUTES || 60
+);
 
 export const uploadPhoto = async (req, res) => {
   try {
@@ -204,11 +211,55 @@ const handleTwitterPosting = async ({ photo, schoolId, mealType, userId }) => {
     let shouldContinue = true;
 
     while (shouldContinue) {
-      const pendingPhotos = await Photo.find({
+      let pendingPhotos = await Photo.find({
         schoolId: photo.schoolId,
         mealType,
         twitterStatus: { $in: [null, "pending"] },
       }).sort({ timestamp: 1 });
+
+      // Skip very old pending photos so they don't block new uploads forever
+      if (TWITTER_MAX_PENDING_MINUTES > 0) {
+        const staleCutoff = new Date(
+          Date.now() - TWITTER_MAX_PENDING_MINUTES * 60 * 1000
+        );
+        const stalePhotos = pendingPhotos.filter(
+          (item) => new Date(item.timestamp) < staleCutoff
+        );
+        if (stalePhotos.length) {
+          console.warn(
+            `Skipping ${stalePhotos.length} stale pending photos for Twitter`
+          );
+          await Photo.updateMany(
+            { _id: { $in: stalePhotos.map((p) => p._id) } },
+            {
+              $set: {
+                twitterStatus: "skipped",
+                twitterBatchKey: "stale pending window exceeded",
+              },
+            }
+          ).catch(() => {});
+        }
+        if (stalePhotos.length) {
+          console.warn(
+            `Skipping ${stalePhotos.length} stale pending photos for Twitter`
+          );
+          await Photo.updateMany(
+            { _id: { $in: stalePhotos.map((p) => p._id) } },
+            {
+              $set: {
+                twitterStatus: "skipped",
+                twitterBatchKey: "stale pending window exceeded",
+              },
+            }
+          ).catch(() => {});
+          // Refresh pending list after skipping stale entries
+          pendingPhotos = await Photo.find({
+            schoolId: photo.schoolId,
+            mealType,
+            twitterStatus: { $in: [null, "pending"] },
+          }).sort({ timestamp: 1 });
+        }
+      }
 
       if (!pendingPhotos.length) {
         return;
