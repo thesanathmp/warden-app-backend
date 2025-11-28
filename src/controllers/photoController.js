@@ -25,16 +25,6 @@ const findSchoolByIdentifier = async (identifier) => {
   return School.findOne({ name: trimmed });
 };
 
-const TWITTER_BATCH_SIZE = Number(process.env.TWITTER_BATCH_SIZE || 4);
-const TWITTER_BATCH_WINDOW_MINUTES = Number(
-  process.env.TWITTER_BATCH_WINDOW_MINUTES || 10
-);
-const TWITTER_SINGLE_FALLBACK_MINUTES = Number(
-  process.env.TWITTER_SINGLE_FALLBACK_MINUTES || 5
-);
-const TWITTER_MAX_PENDING_MINUTES = Number(
-  process.env.TWITTER_MAX_PENDING_MINUTES || 60
-);
 
 export const uploadPhoto = async (req, res) => {
   try {
@@ -122,7 +112,7 @@ export const uploadPhoto = async (req, res) => {
       // Don't fail the main upload if web portal sync fails
     }
 
-    // Post to Twitter after successful upload and web portal sync
+    // Post to Twitter immediately after successful upload and web portal sync
     await handleTwitterPosting({
       photo,
       schoolId,
@@ -157,23 +147,13 @@ const buildTwitterPhotoPayload = (photo, schoolName, wardenName) => ({
   wardenName,
 });
 
-const markPhotosAsPosted = async (photoIds, tweetId) => {
-  await Photo.updateMany(
-    { _id: { $in: photoIds } },
-    {
-      $set: {
-        twitterStatus: "posted",
-        twitterPostId: tweetId,
-        twitterBatchKey: tweetId,
-      },
-    }
-  );
-};
-
 const handleTwitterPosting = async ({ photo, schoolId, mealType, userId }) => {
   try {
     if (!twitterService.isAvailable()) {
       console.log("Twitter posting skipped - twitter service unavailable");
+      await Photo.findByIdAndUpdate(photo._id, {
+        twitterStatus: "skipped",
+      }).catch(() => {});
       return;
     }
 
@@ -185,149 +165,107 @@ const handleTwitterPosting = async ({ photo, schoolId, mealType, userId }) => {
       if (school) break;
     }
 
-    const missingReasons = [];
-    if (!school) {
-      missingReasons.push(
-        `school not found (tried identifiers: ${
-          schoolIdentifiers.join(", ") || "none"
-        })`
-      );
-    }
-    if (!user) missingReasons.push("user not found");
+    if (!school || !user) {
+      const missingReasons = [];
+      if (!school) {
+        missingReasons.push(
+          `school not found (tried identifiers: ${
+            schoolIdentifiers.join(", ") || "none"
+          })`
+        );
+      }
+      if (!user) missingReasons.push("user not found");
 
-    if (missingReasons.length) {
       console.log(
-        "Twitter posting skipped - " +
-          (missingReasons.length ? missingReasons.join(", ") : "unknown reason")
+        "Twitter posting skipped - " + missingReasons.join(", ")
       );
       await Photo.findByIdAndUpdate(photo._id, {
         twitterStatus: "skipped",
-        twitterBatchKey: missingReasons.join(" | "),
       }).catch(() => {});
       return;
     }
 
     const wardenName = user.name || user.phone || "Warden";
-    let shouldContinue = true;
 
-    while (shouldContinue) {
-      let pendingPhotos = await Photo.find({
-        schoolId: photo.schoolId,
-        mealType,
-        twitterStatus: { $in: [null, "pending"] },
-      }).sort({ timestamp: 1 });
+    // Check for other pending photos for the same school and meal type
+    const pendingPhotos = await Photo.find({
+      schoolId: photo.schoolId,
+      mealType: mealType,
+      twitterStatus: { $in: [null, "pending"] },
+    }).sort({ timestamp: 1 });
 
-      // Skip very old pending photos so they don't block new uploads forever
-      if (TWITTER_MAX_PENDING_MINUTES > 0) {
-        const staleCutoff = new Date(
-          Date.now() - TWITTER_MAX_PENDING_MINUTES * 60 * 1000
-        );
-        const stalePhotos = pendingPhotos.filter(
-          (item) => new Date(item.timestamp) < staleCutoff
-        );
-        if (stalePhotos.length) {
-          console.warn(
-            `Skipping ${stalePhotos.length} stale pending photos for Twitter`
-          );
-          await Photo.updateMany(
-            { _id: { $in: stalePhotos.map((p) => p._id) } },
-            {
-              $set: {
-                twitterStatus: "skipped",
-                twitterBatchKey: "stale pending window exceeded",
-              },
-            }
-          ).catch(() => {});
-        }
-        if (stalePhotos.length) {
-          console.warn(
-            `Skipping ${stalePhotos.length} stale pending photos for Twitter`
-          );
-          await Photo.updateMany(
-            { _id: { $in: stalePhotos.map((p) => p._id) } },
-            {
-              $set: {
-                twitterStatus: "skipped",
-                twitterBatchKey: "stale pending window exceeded",
-              },
-            }
-          ).catch(() => {});
-          // Refresh pending list after skipping stale entries
-          pendingPhotos = await Photo.find({
-            schoolId: photo.schoolId,
-            mealType,
-            twitterStatus: { $in: [null, "pending"] },
-          }).sort({ timestamp: 1 });
-        }
-      }
-
-      if (!pendingPhotos.length) {
-        return;
-      }
-
-      const windowStart = new Date(
-        Date.now() - TWITTER_BATCH_WINDOW_MINUTES * 60 * 1000
-      );
-      const batchCandidates = pendingPhotos.filter(
-        (item) => new Date(item.timestamp) >= windowStart
+    // If we have 4 or more pending photos, batch them (up to 4)
+    if (pendingPhotos.length >= 4) {
+      const batch = pendingPhotos.slice(0, 4);
+      const payload = batch.map((item) =>
+        buildTwitterPhotoPayload(item, school.name, wardenName)
       );
 
-      if (batchCandidates.length >= TWITTER_BATCH_SIZE) {
-        const batch = batchCandidates.slice(0, TWITTER_BATCH_SIZE);
-        const payload = batch.map((item) =>
+      console.log(
+        `Posting ${batch.length} photos to Twitter for ${school.name} (batch)`
+      );
+
+      const results = await twitterService.postMultipleWardenPhotos(payload);
+      if (results && results.length) {
+        const tweetId = results[0]?.id;
+        await Photo.updateMany(
+          { _id: { $in: batch.map((p) => p._id) } },
+          {
+            $set: {
+              twitterStatus: "posted",
+              twitterPostId: tweetId,
+            },
+          }
+        );
+        console.log(`Successfully posted ${batch.length} photos to Twitter`);
+      } else {
+        console.warn("Twitter batch post failed - leaving photos as pending");
+      }
+    } else {
+      // Post single photo or small batch immediately
+      const payload = buildTwitterPhotoPayload(photo, school.name, wardenName);
+
+      if (pendingPhotos.length > 1) {
+        // Multiple photos but less than 4 - batch them
+        const batchPayload = pendingPhotos.map((item) =>
           buildTwitterPhotoPayload(item, school.name, wardenName)
         );
-
         console.log(
-          `Attempting multi-photo Twitter post for ${school.name} (${payload.length} photos)`
+          `Posting ${pendingPhotos.length} photos to Twitter for ${school.name} (small batch)`
         );
-
-        const results = await twitterService.postMultipleWardenPhotos(payload);
+        const results = await twitterService.postMultipleWardenPhotos(batchPayload);
         if (results && results.length) {
           const tweetId = results[0]?.id;
-          await markPhotosAsPosted(
-            batch.map((p) => p._id),
-            tweetId
+          await Photo.updateMany(
+            { _id: { $in: pendingPhotos.map((p) => p._id) } },
+            {
+              $set: {
+                twitterStatus: "posted",
+                twitterPostId: tweetId,
+              },
+            }
           );
-          continue;
+          console.log(`Successfully posted ${pendingPhotos.length} photos to Twitter`);
         } else {
-          console.warn("Twitter batch post failed - leaving photos pending");
-          return;
-        }
-      }
-
-      shouldContinue = false;
-
-      const oldestPending = pendingPhotos[0];
-      if (!oldestPending) {
-        return;
-      }
-
-      const ageMinutes =
-        (Date.now() - new Date(oldestPending.timestamp).getTime()) / 60000;
-
-      if (
-        ageMinutes >= TWITTER_SINGLE_FALLBACK_MINUTES &&
-        TWITTER_SINGLE_FALLBACK_MINUTES >= 0
-      ) {
-        console.log(
-          `Posting single photo to Twitter after waiting ${ageMinutes.toFixed(
-            1
-          )} minutes`
-        );
-        const result = await twitterService.postWardenPhoto(
-          buildTwitterPhotoPayload(oldestPending, school.name, wardenName)
-        );
-        if (result) {
-          await markPhotosAsPosted([oldestPending._id], result.id);
+          console.warn("Twitter batch post failed - leaving photos as pending");
         }
       } else {
-        console.log(
-          `Waiting for more photos before Twitter post. Pending: ${pendingPhotos.length}`
-        );
+        // Single photo - post immediately
+        console.log(`Posting single photo to Twitter for ${school.name}`);
+        const result = await twitterService.postWardenPhoto(payload);
+        if (result) {
+          await Photo.findByIdAndUpdate(photo._id, {
+            twitterStatus: "posted",
+            twitterPostId: result.id,
+          });
+          console.log("Photo posted to Twitter successfully");
+        } else {
+          console.warn("Twitter post failed - leaving photo as pending");
+        }
       }
     }
   } catch (error) {
     console.warn("Twitter integration error:", error.message);
+    // Keep photo as pending so it can be retried later if needed
   }
 };
