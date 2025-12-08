@@ -9,6 +9,7 @@
     "seed:schools": "node src/scripts/seedSchools.js",
     "seed:users": "node src/scripts/seedUsers.js",
     "seed:all": "npm run seed:schools && npm run seed:users",
+    "add:users": "node src/scripts/addUsers.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
